@@ -1,26 +1,31 @@
-************
+
 HƯỚNG DẪN THU THẬP DỮ LIỆU CAMERA-LIDAR VÀO FILE .BAG 
+
 #Bước 1:
 source devel/setup.bash
 roslaunch ouster_ros os1.launch os1_udp_dest:=10.5.5.1 os1_hostname:=10.5.5.54
+
 #Bước 2: mở terminal mới mở rviz để quan sát dữ liệu camera và lidar
 rviz
+
 #Bước 3: mở terminal để bật camera 
 roslaunch usb_cam usb_cam.launch
+
 Bước 4: Vào rviz thêm pointcloud2 và thêm image raw, chọn frame là //os1_lidar
 
-Bước 5:mở terminal mới để ghi dữ liệu
+Bước 5: mở terminal mới để ghi dữ liệu
 rosbag record /usb_cam/image_raw /os1_cloud_node/points /os1_cloud_node/imu -o dulieu_cam_lidar.bag
 ctrl+c để stop
-mở lại bằng 
+
+Bước 6: mở lại bằng 
 rosbag play dulieu_cam_lidar.bag //thay bằng tên file thực tế
 
 *****************************************************************************************************************************
-HƯỚNG DẪN HIỆU CHỈNH CAMERA VÀ LIDAR ĐỂ THU ĐƯỢC MA TRẬN (K, D, R, T)
+**HƯỚNG DẪN HIỆU CHỈNH CAMERA VÀ LIDAR ĐỂ THU ĐƯỢC MA TRẬN (K, D, R, T)**
 
 # Bước 1: Intrinsic (Hiệu chỉnh nội tại cho camera)
 
-Cách 1: Hiệu chỉnh thời gian thực (camera trực tiếp) -- nên dùng
+_**Cách 1: Hiệu chỉnh thời gian thực (camera trực tiếp) -- nên dùng**_
 
 roscore
 roslaunch usb_cam usb_cam.launch
@@ -43,7 +48,7 @@ rosrun camera_calibration cameracalibrator.py --size 6x8 --square 0.059 --camera
  • Sau khi hoàn thành, bấm SAVE để lưu file hiệu chỉnh.
  • Bấm COMMIT để ghi dữ liệu này về ROS (xuất ra file .yaml).
  
-Cách 2:  Hiệu chỉnh Camera từ các frame ảnh xuất ra từ file .bag:
+_**Cách 2:  Hiệu chỉnh nội cho Camera từ các frame ảnh xuất ra từ file .bag:**_
 python3 extract_frames.py --> tạo ra thư mục calib_frames chứa các frams ảnh xuất ra từ file .bag
 python3 intrinsic_calibrate.py --> tạo ra K và D lưu trong camera_intrinsic.yaml 
 
