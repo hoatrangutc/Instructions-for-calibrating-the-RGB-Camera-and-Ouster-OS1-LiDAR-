@@ -1,0 +1,30 @@
+calibration_info:
+  frames: 80
+  mean_px: 0.036994
+  model: 5-param (k1,k2,p1,p2,k3)
+  quality: EXCELLENT
+  rms_px: 0.274763
+camera_matrix:
+  cols: 3
+  data:
+  - 448.9443277836273
+  - 0.0
+  - 328.1278074020808
+  - 0.0
+  - 449.8824080758361
+  - 229.13027052795243
+  - 0.0
+  - 0.0
+  - 1.0
+  rows: 3
+distortion_coefficients:
+  cols: 5
+  data:
+  - 0.08804103349773844
+  - -0.012905824328900526
+  - -0.002744215700176299
+  - -0.007056489723647028
+  - -0.4767527602193595
+  rows: 1
+image_height: 480
+image_width: 640
