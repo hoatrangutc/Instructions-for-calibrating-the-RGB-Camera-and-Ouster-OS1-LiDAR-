@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Hiệu chuẩn nội tại camera pinhole từ ảnh bàn cờ (không dùng LiDAR).
+
+Cài đặt: python3 -m pip install numpy opencv-python
+Chạy:    python3 calibrate_from_images.py --images calib_frames
+Ví dụ:   python3 calibrate_from_images.py --images data_sync/cam_frames --show
+PATTERN là số GÓC BÊN TRONG; square là cạnh một ô, đơn vị mét.
+Chỉ dùng ảnh bàn cờ từ cùng camera, độ phân giải, focus và zoom.
+RMS được tính trên ảnh đã dùng hiệu chuẩn, không phải kiểm định độc lập.
+"""
+import argparse
+import csv
+import json
+from pathlib import Path
+import sys
+
+import cv2
+import numpy as np
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--images', type=Path, default=Path('calib_frames'))
+    p.add_argument('--output-dir', type=Path, default=Path('.'))
+    p.add_argument('--pattern', type=int, nargs=2, default=(6, 8), metavar=('COLS', 'ROWS'))
+    p.add_argument('--square', type=float, default=0.059, help='Cạnh ô, mét (mặc định 0.059)')
+    p.add_argument('--max-frames', type=int, default=500)
+    p.add_argument('--min-frames', type=int, default=10)
+    p.add_argument('--blur-threshold', type=float, default=100.0,
+                   help='Ngưỡng phương sai Laplacian; đặt 0 để tắt')
+    p.add_argument('--duplicate-threshold', type=float, default=3.0,
+                   help='Sai khác trung bình ảnh thu nhỏ so với ảnh vừa giữ; 0 để tắt')
+    p.add_argument('--min-scale', type=float, default=0.015,
+                   help='Tỉ lệ diện tích hộp bao các góc bàn cờ / diện tích ảnh')
+    p.add_argument('--show', action='store_true', help='Mở cửa sổ xem sau khi đã lưu kết quả')
+    args = p.parse_args()
+    if min(args.pattern) < 2 or not np.isfinite(args.square) or args.square <= 0:
+        p.error('pattern phải >= 2 ở mỗi chiều; square phải hữu hạn và > 0')
+    if args.min_frames < 3 or args.max_frames < args.min_frames:
+        p.error('Cần max-frames >= min-frames >= 3')
+    if (not np.isfinite(args.min_scale) or not 0 <= args.min_scale < 1
+            or not np.isfinite(args.blur_threshold) or args.blur_threshold < 0
+            or not np.isfinite(args.duplicate_threshold) or args.duplicate_threshold < 0):
+        p.error('Ngưỡng lọc không hợp lệ')
+    return args
+
+
+def detect_board_corners(gray, pattern):
+    """Prefer SB subpixel corners; do not refine them again with a large window."""
+    if hasattr(cv2, 'findChessboardCornersSB'):
+        found, corners = cv2.findChessboardCornersSB(
+            gray, pattern, cv2.CALIB_CB_NORMALIZE_IMAGE)
+        if found:
+            return True, np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+    found, corners = cv2.findChessboardCorners(
+        gray, pattern, cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+    if not found:
+        return False, None
+    corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+    grid = corners.reshape(pattern[1], pattern[0], 2)
+    spacing = np.concatenate([
+        np.linalg.norm(np.diff(grid, axis=1), axis=2).ravel(),
+        np.linalg.norm(np.diff(grid, axis=0), axis=2).ravel()])
+    # winSize is a HALF-window. Keep the neighbourhood below corner spacing.
+    half_window = int(np.floor(0.25 * float(np.min(spacing))))
+    if half_window < 1:
+        return False, None
+    half_window = min(5, half_window)
+    refined = cv2.cornerSubPix(
+        gray, corners.copy(), (half_window, half_window), (-1, -1),
+        (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
+    # Fall back to initial detections if local refinement jumps too far.
+    shift = np.linalg.norm(refined.reshape(-1, 2) - corners.reshape(-1, 2), axis=1)
+    if float(np.max(shift)) > half_window:
+        return True, corners
+    return True, refined
+
+
+def collect_candidates(args):
+    paths = sorted(p for p in args.images.iterdir()
+                   if p.is_file() and p.suffix.lower() in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'})
+    if not paths:
+        raise RuntimeError(f'Không có ảnh trong {args.images}')
+    stats = dict(total=len(paths), unreadable=0, blurry=0, duplicate=0,
+                 no_board=0, small_board=0)
+    candidates, size, previous = [], None, None
+    pattern = tuple(args.pattern)
+    for i, path in enumerate(paths):
+        image = cv2.imread(str(path))
+        if image is None:
+            stats['unreadable'] += 1
+            print(f'Bỏ ảnh không đọc được: {path}')
+            continue
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        current_size = gray.shape[::-1]
+        if size is None:
+            size = current_size
+        elif current_size != size:
+            raise RuntimeError(f'Khác độ phân giải: {path} là {current_size}, ảnh đầu là {size}. '
+                               'Hãy tách riêng các bộ ảnh; không tự resize để trộn dữ liệu.')
+        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if args.blur_threshold > 0 and blur < args.blur_threshold:
+            stats['blurry'] += 1
+            continue
+        thumbnail = cv2.resize(gray, (16, 16)).astype(np.float32)
+        if (args.duplicate_threshold > 0 and previous is not None
+                and np.mean(np.abs(thumbnail - previous)) < args.duplicate_threshold):
+            stats['duplicate'] += 1
+            continue
+        found, corners = detect_board_corners(gray, pattern)
+        if not found:
+            stats['no_board'] += 1
+            continue
+        points = corners.reshape(-1, 2)
+        scale = float(np.prod(np.ptp(points, axis=0)) / (size[0] * size[1]))
+        if scale < args.min_scale:
+            stats['small_board'] += 1
+            continue
+        center = points.mean(axis=0) / np.array(size)
+        direction = points[pattern[0] - 1] - points[0]
+        angle = float(np.arctan2(direction[1], direction[0]))
+        # Features describe image position/size/in-plane rotation, not full 3D board pose.
+        feature = [*center, np.sqrt(scale), 0.25*np.cos(2*angle), 0.25*np.sin(2*angle)]
+        candidates.append(dict(path=path, corners=corners, feature=feature,
+                               scale=scale, blur=blur, angle_deg=float(np.degrees(angle))))
+        previous = thumbnail
+        if (i + 1) % 100 == 0:
+            print(f'Đã đọc {i+1}/{len(paths)} ảnh; giữ {len(candidates)} ảnh bàn cờ')
+    print('Thống kê lọc:', stats)
+    print(f'Ảnh bàn cờ hợp lệ: {len(candidates)}')
+    return candidates, size, stats
+
+
+def pick_diverse_frames(candidates, n):
+    if len(candidates) <= n:
+        return candidates
+    features = np.asarray([c['feature'] for c in candidates], dtype=np.float64)
+    # Seed with the board nearest the image centre, then farthest-point sampling.
+    first = int(np.argmin(np.linalg.norm(features[:, :2] - 0.5, axis=1)))
+    chosen = [first]
+    distances = np.full(len(candidates), np.inf)
+    for _ in range(n - 1):
+        d = np.linalg.norm(features - features[chosen[-1]], axis=1)
+        distances = np.minimum(distances, d)
+        distances[chosen] = -1
+        chosen.append(int(np.argmax(distances)))
+    return [candidates[i] for i in sorted(chosen)]
+
+
+def calibrate(selected, size, pattern, square):
+    obj = np.zeros((pattern[0]*pattern[1], 3), np.float32)
+    obj[:, :2] = np.mgrid[0:pattern[0], 0:pattern[1]].T.reshape(-1, 2) * square
+    objects = [obj.copy() for _ in selected]
+    corners = [c['corners'] for c in selected]
+    rms, K, D, rvecs, tvecs = cv2.calibrateCamera(objects, corners, size, None, None)
+    if (not np.isfinite(rms) or not np.isfinite(K).all() or not np.isfinite(D).all()
+            or K[0, 0] <= 0 or K[1, 1] <= 0):
+        raise RuntimeError('Kết quả hiệu chuẩn không hợp lệ; kiểm tra bàn cờ và dữ liệu.')
+    errors = []
+    for points, image_corners, rv, tv in zip(objects, corners, rvecs, tvecs):
+        projected, _ = cv2.projectPoints(points, rv, tv, K, D)
+        residuals = image_corners.reshape(-1, 2) - projected.reshape(-1, 2)
+        errors.append(float(np.sqrt(np.mean(np.sum(residuals**2, axis=1)))))
+    return rms, K, D, np.asarray(errors)
+
+
+def save_results(args, selected, size, stats, rms, K, D, errors):
+    out = args.output_dir
+    out.mkdir(parents=True, exist_ok=True)
+    # Save numerical results before any optional GUI interaction.
+    np.save(out / 'camera_K.npy', K)
+    np.save(out / 'camera_D.npy', D)
+    np.savez(out / 'camera_intrinsic.npz', K=K, D=D, image_size=np.array(size),
+             rms=rms, per_view_rms=errors, pattern=np.array(args.pattern), square_m=args.square)
+    with (out / 'calibration_per_image.csv').open('w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['image', 'rms_px', 'laplacian_variance', 'board_scale', 'in_plane_angle_deg'])
+        for c, error in zip(selected, errors):
+            writer.writerow([str(c['path'].resolve()), error, c['blur'], c['scale'], c['angle_deg']])
+    summary = dict(image_size_wh=list(size), pattern_inner_corners=list(args.pattern),
+                   square_m=args.square, used_frames=len(selected), filter_stats=stats,
+                   training_rms_px=float(rms), median_view_rms_px=float(np.median(errors)),
+                   max_view_rms_px=float(max(errors)), K=K.tolist(), D=D.tolist(),
+                   corner_detector='SB; fallback classic with adaptive small refinement window',
+                   note='Sai số trên bộ ảnh hiệu chuẩn; chưa kiểm định bằng bộ ảnh độc lập.')
+    (out / 'calibration_summary.json').write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def make_previews(args, selected, size, K, D):
+    # Actually choose boards nearest each corner and the image centre.
+    centers = np.array([c['feature'][:2] for c in selected])
+    indices = []
+    for target in [(0, 0), (1, 0), (0, 1), (1, 1), (0.5, 0.5)]:
+        idx = int(np.argmin(np.linalg.norm(centers - target, axis=1)))
+        if idx not in indices:
+            indices.append(idx)
+    preview_dir = args.output_dir / 'undistort_preview'
+    preview_dir.mkdir(exist_ok=True)
+    previews = []
+    for number, idx in enumerate(indices):
+        image = cv2.imread(str(selected[idx]['path']))
+        if image is None:
+            print(f'Không đọc lại được ảnh xem thử: {selected[idx]["path"]}')
+            continue
+        corrected = cv2.undistort(image, K, D)
+        combined = np.hstack([image, corrected])
+        factor = min(1.0, 1600 / combined.shape[1])
+        combined = cv2.resize(combined, None, fx=factor, fy=factor)
+        cv2.putText(combined, 'Original', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 0), 2)
+        cv2.putText(combined, 'Undistorted', (combined.shape[1]//2+10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 0), 2)
+        path = preview_dir / f'preview_{number:02d}.png'
+        if not cv2.imwrite(str(path), combined):
+            raise IOError(f'Không lưu được {path}')
+        previews.append(path)
+    if args.show:
+        try:
+            for path in previews:
+                cv2.imshow('Original | Undistorted - ESC to close', cv2.imread(str(path)))
+                if cv2.waitKey(0) & 0xFF == 27:
+                    break
+            cv2.destroyAllWindows()
+        except cv2.error as exc:
+            print(f'Không mở được cửa sổ; kết quả và ảnh xem thử đã lưu. {exc}')
+
+
+def main():
+    args = parse_args()
+    if not args.images.is_dir():
+        raise RuntimeError(f'Không tìm thấy thư mục ảnh: {args.images}')
+    candidates, size, stats = collect_candidates(args)
+    if len(candidates) < args.min_frames:
+        raise RuntimeError(f'Chỉ có {len(candidates)} ảnh hợp lệ, cần ít nhất {args.min_frames}. '
+                           'Kiểm tra số góc bên trong, độ rõ và các ngưỡng lọc. '
+                           'Thu bảng ở nhiều vị trí, khoảng cách và độ nghiêng phối cảnh.')
+    selected = pick_diverse_frames(candidates, args.max_frames)
+    print(f'Hiệu chuẩn với {len(selected)} ảnh, kích thước {size} (rộng, cao)')
+    rms, K, D, errors = calibrate(selected, size, tuple(args.pattern), args.square)
+    save_results(args, selected, size, stats, rms, K, D, errors)
+    print(f'RMS trên bộ hiệu chuẩn: {rms:.4f} px')
+    print(f'RMS từng ảnh: trung vị {np.median(errors):.4f}, lớn nhất {max(errors):.4f} px')
+    print('K =', K, '\nD =', D.ravel())
+    print(f'Đã lưu kết quả tại: {args.output_dir.resolve()}')
+    print('Cần kiểm tra ảnh khử méo và bộ ảnh độc lập trước khi dùng kết quả.')
+    make_previews(args, selected, size, K, D)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (RuntimeError, ValueError, OSError, cv2.error) as exc:
+        print(f'LỖI: {exc}', file=sys.stderr)
+        sys.exit(1)
