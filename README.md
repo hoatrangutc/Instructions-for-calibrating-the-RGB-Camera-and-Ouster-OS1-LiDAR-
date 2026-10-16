@@ -65,7 +65,7 @@ _**Cách 2:  Hiệu chỉnh nội cho Camera từ các frame ảnh xuất ra t�
 
 python3 extract_frames.py --> tạo ra thư mục calib_frames chứa các frams ảnh xuất ra từ file .bag
 
-python3 intrinsic_calibrate.py --> tạo ra K và D lưu trong camera_intrinsic.yaml 
+python3 calibrate_from_images.py --> tạo ra K và D  
 
 # Bước 2: Hiệu chỉnh ngoại với LiDAR
 
